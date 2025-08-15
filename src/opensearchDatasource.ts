@@ -1,5 +1,5 @@
 import _ from 'lodash';
-import { from, Observable, of } from 'rxjs';
+import { from, merge, Observable, of } from 'rxjs';
 import { map, mergeMap, tap } from 'rxjs/operators';
 import {
   DataSourceInstanceSettings,
@@ -20,11 +20,6 @@ import {
   LogLevel,
   SupplementaryQueryOptions,
   SupplementaryQueryType,
-  LoadingState,
-  LiveChannelScope,
-  StreamingDataFrame,
-  DataFrameJSON,
-  LiveChannelEvent,
 } from '@grafana/data';
 import { IndexPattern } from './index_pattern';
 import { QueryBuilder } from './QueryBuilder';
@@ -36,8 +31,6 @@ import {
   TemplateSrv,
   getDataSourceSrv,
   getTemplateSrv,
-  getGrafanaLiveSrv,
-  config,
 } from '@grafana/runtime';
 import {
   DataLinkConfig,
@@ -70,6 +63,7 @@ import {
   toggleQueryFilterForLucene,
   toggleQueryFilterForPPL,
 } from 'modifyQuery';
+import { doChannelStream } from 'streaming';
 
 // Those are metadata fields as defined in https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-fields.html#_identity_metadata_fields.
 // custom fields can start with underscores, therefore is not safe to exclude anything that starts with one.
@@ -657,8 +651,17 @@ export class OpenSearchDatasource
     console.log('[OpenSearchDatasource] query', request);
 
     if (request.liveStreaming) {
-      console.log('[OpenSearchDatasource] live streaming');
-      return this.runLiveQueryThroughBackend(request);
+      // this is still an in-development feature,
+      // we do not support mixing stream-queries with normal-queries for now.
+      return merge(
+        ...request.targets.map((q) =>
+          doChannelStream(
+            this.applyTemplateVariables(q, request.scopedVars, request.filters),
+            this, // the datasource
+            request
+          )
+        )
+      );
     }
 
     return super.query(request).pipe(
@@ -672,100 +675,6 @@ export class OpenSearchDatasource
       }),
       map((response) => {
         return enhanceDataFramesWithDataLinks(response, this.dataLinks, this.uid, this.name, this.type);
-      })
-    );
-  }
-
-  async getLiveStreamKey(query: OpenSearchQuery): Promise<string> {
-    const str = JSON.stringify({ query: query.query });
-    const msgUint8 = new TextEncoder().encode(str); // encode as (utf-8) Uint8Array
-    const hashBuffer = await crypto.subtle.digest('SHA-1', msgUint8); // hash the message
-    const hashArray = Array.from(new Uint8Array(hashBuffer.slice(0, 8))); // first 8 bytes
-    return `${query.datasource?.uid}/${hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')}/${config.bootData.user.orgId}`;
-  }
-
-  runLiveQueryThroughBackend(request: DataQueryRequest<OpenSearchQuery>): Observable<DataQueryResponse> {
-    const logQueries = request.targets.filter((query) => {
-      return query.metrics?.length === 1 && query.metrics[0].type === 'logs' && !query.hide;
-    });
-
-    if (logQueries.length === 0) {
-      console.log('[OpenSearch runLiveQueryThroughBackend] No live stream-able queries found.');
-      return of({ data: [], state: LoadingState.Done, key: request.requestId });
-    }
-
-    const firstLogQuery: OpenSearchQuery = logQueries[0];
-    const { format, ...streamingQueryPayload } = firstLogQuery;
-    const finalStreamingQuery = {
-      ...streamingQueryPayload,
-      query: streamingQueryPayload.query || '*',
-      refId: firstLogQuery.refId,
-    };
-
-    const streamPath = from(this.getLiveStreamKey(firstLogQuery));
-    const liveService = getGrafanaLiveSrv();
-
-    if (!liveService) {
-      console.error('[OpenSearch runLiveQueryThroughBackend] Grafana Live service not available.');
-      return of({
-        data: [],
-        state: LoadingState.Error,
-        error: { message: 'Grafana Live service not available' },
-        key: request.requestId,
-      });
-    }
-
-    console.log(
-      `[OpenSearch runLiveQueryThroughBackend] Setting up Grafana Live stream for path: ${streamPath} with query:`,
-      finalStreamingQuery
-    );
-
-    // maximum time to keep values
-    const range = request.range;
-    const maxDelta = range.to.valueOf() - range.from.valueOf() + 1000;
-    let maxLength = request.maxDataPoints ?? 1000;
-    if (maxLength > 100) {
-      // for small buffers, keep them small
-      maxLength *= 2;
-    }
-
-    // Copied from Loki
-    // https://github.com/grafana/grafana/blob/ac832c157e12f6c7c65f74f73d5ea92541eb7d8f/public/app/plugins/datasource/loki/streaming.ts#L46C1-L61C5
-    let frame: StreamingDataFrame | undefined = undefined;
-    const updateFrame = (msg: LiveChannelEvent<unknown>) => {
-      console.log('Got message', msg);
-      if ('message' in msg && msg.message) {
-        const p: DataFrameJSON = msg.message;
-        if (!frame) {
-          frame = StreamingDataFrame.fromDataFrameJSON(p, {
-            maxLength,
-            maxDelta,
-          });
-        } else {
-          frame.push(p);
-        }
-      }
-      return frame;
-    };
-
-    return streamPath.pipe(
-      mergeMap((streamPath) => {
-        return liveService
-          .getStream({
-            scope: LiveChannelScope.DataSource,
-            namespace: this.uid,
-            path: `tail/${streamPath}`,
-            data: finalStreamingQuery, // Pass query data here
-          })
-          .pipe(
-            map((evt) => {
-              const frame = updateFrame(evt);
-              return {
-                data: frame ? [frame] : [],
-                state: LoadingState.Streaming,
-              };
-            })
-          );
       })
     );
   }
